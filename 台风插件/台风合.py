@@ -2,7 +2,7 @@ __plugin_meta__ = {
     'name': '台风查询',
     'author': '茉莉奶绿（原创） / 飞行漂绒（修改优化）',
     'description': '中央气象台台风查询（优先官网路径图，无则本地绘图）',
-    'version': '1.0.0',
+    'version': '1.0.1',
 }
 
 import asyncio
