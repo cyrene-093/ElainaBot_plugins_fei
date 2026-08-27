@@ -1,7 +1,7 @@
 __plugin_meta__ = {
     'name': '台风图',
     'author': '茉莉奶绿（原创） / 飞行漂绒（修改优化）',
-    'description': '中央气象台台风查询（有官网图则出图，没有则 Markdown 文字）',
+    'description': '中央气象台台风查询（最强/活跃出图，停编走 Markdown）',
     'version': '1.1.0',
 }
 
@@ -39,17 +39,20 @@ _HEADERS = {
 }
 _PUB_HEADERS = {**_HEADERS, 'Referer': f'{NMC_PUB}/probability.html'}
 _PUB_PAGES = ('probability.html',) + tuple(f'probability-img{i}.html' for i in range(2, 9))
+_SESSION = None
+_SESSION_LOCK = asyncio.Lock()
+_MEM, _LOCKS = {}, {}
+_LIST_TTL, _VIEW_TTL, _MAP_TTL, _IMG_TTL = 60, 90, 180, 180  # 图：磁盘/图床 3 分钟
+_PAGE_SIZE = 12
 _FONT_CANDIDATES = (
     'C:/Windows/Fonts/msyh.ttc', 'C:/Windows/Fonts/msyh.ttf', 'C:/Windows/Fonts/simhei.ttf',
     '/usr/share/fonts/truetype/wqy/wqy-microhei.ttc',
     '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
     '/System/Library/Fonts/PingFang.ttc',
 )
-
-_SESSION = None
-_SESSION_LOCK = asyncio.Lock()
-_MEM, _FONTS, _LOCKS = {}, {}, {}
-_LIST_TTL, _VIEW_TTL, _MAP_TTL, _IMG_TTL = 60, 90, 180, 180  # 图：磁盘/图床 3 分钟
+_FONT_CACHE = {}
+_INK, _MUTED, _LINE, _BG = (30, 41, 59), (100, 116, 139), (226, 232, 240), (248, 250, 252)
+_LIVE, _WHITE = (185, 28, 28), (255, 255, 255)
 
 
 def _cache_get(key):
@@ -91,6 +94,34 @@ async def _close_http():
     _SESSION = None
 
 
+def _btn(text, data, *, style=1, enter=True):
+    item = {'text': str(text)[:16], 'data': str(data), 'type': 2, 'style': style}
+    if enter:
+        item['enter'] = True
+    return item
+
+
+def _nav_btns():
+    return [
+        [_btn('最强台风', '最强台风'), _btn('活跃台风', '活跃台风')],
+        [_btn('台风列表', '台风列表'), _btn('台风帮助', '台风帮助', style=4)],
+    ]
+
+
+def _list_btns(year, page, pages):
+    rows = []
+    if pages > 1:
+        row = []
+        if page > 1:
+            row.append(_btn('上一页', f'台风列表 {year} {page - 1}'))
+        if page < pages:
+            row.append(_btn('下一页', f'台风列表 {year} {page + 1}'))
+        if row:
+            rows.append(row)
+    rows.extend(_nav_btns())
+    return rows
+
+
 def _chip(show, cmd):
     return (
         f'<qqbot-cmd-input text="{quote(str(cmd), safe="")}" '
@@ -98,25 +129,15 @@ def _chip(show, cmd):
     )
 
 
-def _nav(refresh='台风', extra=None):
-    a, b, c, d = (
-        _chip('最强台风', '最强台风'),
-        _chip('活跃台风', '活跃台风'),
-        _chip('台风列表', '台风列表'),
-        _chip('台风帮助', '台风帮助'),
-    )
-    return f'────────\n{a}　　{b}\n{c}　　{d}'
-
-
-def _ms(start):
-    return int((time.time() - start) * 1000)
-
-
 def _year_bar(selected=None):
     now = datetime.now().year
     chips = [_chip(str(y), f'台风列表 {y}') for y in range(now, now - 6, -1)]
     rows = ['　　'.join(chips[i:i + 3]) for i in range(0, len(chips), 3)]
-    return '点选年份查看往年列表\n' + '\n'.join(rows)
+    return '📅 点选年份查看往年列表\n' + '\n'.join(rows)
+
+
+def _ms(start):
+    return int((time.time() - start) * 1000)
 
 
 def _cmd_head(match):
@@ -127,21 +148,24 @@ def _cmd_head(match):
 
 def _hint_query():
     return (
-        '请补上名称、编号或年份。\n\n'
-        '示例：\n'
+        '❗ 请补上名称、编号或年份。\n\n'
+        '💡 示例：\n'
         '`台风查询 沙德尔`　按名称\n'
         '`台风查询 2411`　按编号\n'
-        '`台风列表 2023`　查看该年名单\n\n'
-        + _year_bar()
+        '`台风列表 2023`　查看该年名单'
     )
 
 
 def _hint_year():
-    return '请补上四位年份，例如：`台风列表 2023`\n\n' + _year_bar()
+    return '❗ 请补上四位年份，例如：`台风列表 2023`'
 
 
 def _hint_miss():
-    return '查询不到，请正确使用。例如：`台风列表 2025`　`台风查询 沙德尔`'
+    return '❗ 查询不到，请正确使用。例如：`台风列表 2025`　`台风查询 沙德尔`'
+
+
+def _hint_noarg(cmd=None):
+    return _hint_miss()
 
 
 def _parse_year(text):
@@ -153,6 +177,41 @@ def _parse_year(text):
     if year < 1945 or year > now:
         return None
     return year
+
+
+def _parse_page_token(text):
+    s = str(text or '').strip()
+    if re.fullmatch(r'(19|20)\d{2}', s):
+        return None
+    m = re.fullmatch(r'(?:p|第)?([1-9]\d?)页?', s, re.I)
+    return int(m.group(1)) if m else None
+
+
+def _parse_year_page(text, *, default_year=None):
+    s = str(text or '').strip()
+    page = 1
+    if not s:
+        return default_year, 1
+    parts = s.split()
+    tok = _parse_page_token(parts[-1])
+    if tok is not None and (len(parts) > 1 or default_year is not None):
+        page = tok
+        parts = parts[:-1]
+        s = ' '.join(parts).strip()
+    if not s:
+        return default_year, page
+    m = re.fullmatch(r'((?:19|20)\d{2})(?:第([1-9]\d?)页)?', s)
+    if m:
+        year = _parse_year(m.group(1))
+        if year is None:
+            return None, None
+        if m.group(2):
+            page = int(m.group(2))
+        return year, page
+    year = _parse_year(s)
+    if year is None:
+        return None, None
+    return year, page
 
 
 def _to_float(v):
@@ -257,67 +316,6 @@ def _disk_save(name, data):
         log.warning('图片缓存写入失败: %s', e)
 
 
-def _font(size):
-    hit = _FONTS.get(size)
-    if hit:
-        return hit
-    try:
-        from PIL import ImageFont
-        for p in _FONT_CANDIDATES:
-            if os.path.isfile(p):
-                try:
-                    font = ImageFont.truetype(p, size)
-                    _FONTS[size] = font
-                    return font
-                except Exception:
-                    continue
-        font = ImageFont.load_default()
-        _FONTS[size] = font
-        return font
-    except Exception:
-        return None
-
-
-def _tw(draw, text, font):
-    if hasattr(draw, 'textbbox'):
-        b = draw.textbbox((0, 0), text, font=font)
-        return b[2] - b[0], b[3] - b[1]
-    return len(text) * 7, 12
-
-
-def _trim_white(im, limit=248, pad=6):
-    g = im.convert('L')
-    w, h = g.size
-    px = g.load()
-    step_x, step_y = max(1, w // 70), max(1, h // 70)
-
-    def row_bg(y):
-        return all(px[x, y] >= limit for x in range(0, w, step_x))
-
-    def col_bg(x):
-        return all(px[x, y] >= limit for y in range(0, h, step_y))
-
-    top, bot, left, right = 0, h - 1, 0, w - 1
-    while top < h - 24 and row_bg(top):
-        top += 1
-    while bot > top + 24 and row_bg(bot):
-        bot -= 1
-    while left < w - 24 and col_bg(left):
-        left += 1
-    while right > left + 24 and col_bg(right):
-        right -= 1
-    box = (max(0, left - pad), max(0, top - pad), min(w, right + 1 + pad), min(h, bot + 1 + pad))
-    nw, nh = box[2] - box[0], box[3] - box[1]
-    if nw < w * 0.58 or nh < h * 0.58 or nw * nh > 0.96 * w * h:
-        return im
-    return im.crop(box)
-
-
-def _title_bits(view):
-    cn, en = view.get('cn') or '', view.get('en') or ''
-    return (cn or en or '台风'), (en if en and cn and en != cn else '')
-
-
 def _info_pairs(view):
     pts = view.get('points') or []
     p = pts[-1] if pts else {}
@@ -364,117 +362,6 @@ def _defense_tips(view):
     if wind >= 24.5 or level in ('TY', 'STY', 'SuperTY') or '台风' in strong:
         return ['尽量减少外出，关闭门窗并收妥阳台物品', '远离工地、广告牌及高大树木', '低洼地区注意内涝，切勿涉水通行']
     return ['外出注意大风和强降雨', '关闭门窗，移走阳台易坠物', '积水勿趟，远离树木和广告牌']
-
-
-def _wrap(draw, text, font, max_w):
-    text = str(text or '')
-    if not text:
-        return []
-    if not font:
-        return [text]
-    lines, cur = [], ''
-    for ch in text:
-        if cur and _tw(draw, cur + ch, font)[0] > max_w:
-            lines.append(cur)
-            cur = ch
-        else:
-            cur += ch
-    if cur:
-        lines.append(cur)
-    return lines or [text]
-
-
-def compose_official(data, view, *, max_side=720):
-    from PIL import Image, ImageDraw
-    im = Image.open(io.BytesIO(data)).convert('RGB')
-    im = _trim_white(im)
-    w, h = im.size
-    m = max(w, h) or 1
-    if m > max_side:
-        im = im.resize((max(1, int(w * max_side / m)), max(1, int(h * max_side / m))), Image.Resampling.BILINEAR)
-        w, h = im.size
-
-    title, sub = _title_bits(view)
-    pairs, fc_text, tips = _info_pairs(view), _forecast_line(view), _defense_tips(view)
-    tf, lf = _font(24) or _font(22), _font(15) or _font(14)
-    vf, sf = _font(16) or _font(15), _font(14) or lf
-    probe = ImageDraw.Draw(im)
-    pad_x, pad_y = 16, 12
-    max_txt = max(48, w - pad_x * 2)
-    col_w = max(48, w // 2 - pad_x - 8)
-    gap = 8
-    title_lines = _wrap(probe, title, tf, max_txt)
-    sub_lines = _wrap(probe, sub, sf, max_txt) if sub else []
-    pair_rows = []
-    for i in range(0, len(pairs), 2):
-        cells = []
-        for lab, val in pairs[i:i + 2]:
-            lw = _tw(probe, lab, lf)[0] if lf else 36
-            vmax = max(20, col_w - lw - gap)
-            cells.append((lab, lw, _wrap(probe, str(val), vf, vmax) or ['-']))
-        pair_rows.append(cells)
-    fc_lines = _wrap(probe, fc_text, sf, max_txt) if fc_text else []
-    tip_lines = []
-    if tips:
-        tip_lines.append('防护建议')
-        for i, t in enumerate(tips[:3], 1):
-            tip_lines.extend(_wrap(probe, f'{i}. {t}', sf, max_txt))
-    line_h_t = max((_tw(probe, '国', tf)[1] if tf else 24), 20) + 3
-    line_h_v = max((_tw(probe, '国', vf)[1] if vf else 16), 16) + 3
-    line_h_s = max((_tw(probe, '国', sf)[1] if sf else 14), 14) + 3
-    cap_h = pad_y + line_h_t * max(1, len(title_lines)) + line_h_s * len(sub_lines) + 10
-    for cells in pair_rows:
-        cap_h += max(len(c[2]) for c in cells) * line_h_v + 2
-    if fc_lines:
-        cap_h += 6 + line_h_s * len(fc_lines)
-    if tip_lines:
-        cap_h += 14 + line_h_s * len(tip_lines)
-    cap_h += pad_y + 10
-
-    bg = (248, 250, 252)
-    out = Image.new('RGB', (w, h + cap_h), bg)
-    out.paste(im, (0, 0))
-    d = ImageDraw.Draw(out)
-    d.line((0, h, w, h), fill=(210, 216, 224), width=2)
-    y = h + pad_y
-    if tf:
-        for line in title_lines:
-            d.text((pad_x, y), line, font=tf, fill=(18, 28, 42))
-            y += line_h_t
-    if sub and sf:
-        for line in sub_lines:
-            d.text((pad_x, y), line, font=sf, fill=(96, 108, 122))
-            y += line_h_s
-    d.line((pad_x, y, w - pad_x, y), fill=(226, 230, 236))
-    y += 8
-    mid = w // 2
-    for cells in pair_rows:
-        row_h = max(len(c[2]) for c in cells) * line_h_v
-        for col, (lab, lw, vlines) in enumerate(cells):
-            x = pad_x if col == 0 else mid + 6
-            if lf:
-                d.text((x, y), lab, font=lf, fill=(118, 128, 142))
-            if vf:
-                vx = x + lw + gap
-                for j, line in enumerate(vlines):
-                    d.text((vx, y + j * line_h_v), line, font=vf, fill=(22, 32, 46))
-        y += row_h + 2
-    if fc_lines:
-        y += 4
-        for line in fc_lines:
-            d.text((pad_x, y), line, font=sf, fill=(72, 84, 98))
-            y += line_h_s
-    if tip_lines:
-        y += 4
-        d.line((pad_x, y, w - pad_x, y), fill=(226, 230, 236))
-        y += 8
-        for i, line in enumerate(tip_lines):
-            d.text((pad_x, y), line, font=sf, fill=(46, 92, 138) if i == 0 else (40, 52, 66))
-            y += line_h_s
-
-    buf = io.BytesIO()
-    out.save(buf, format='JPEG', quality=70)
-    return buf.getvalue(), out.size
 
 
 async def _http(url, *, binary=False, timeout=12, headers=None):
@@ -681,35 +568,18 @@ async def fetch_official_track_png(view):
     if not hit:
         return None, ''
     src = hit.get('img') or ''
-    mid = src.replace('/TCBU/', '/TCBU/medium/')
-    name = _disk_name('rawm', src) + '.bin'
+    name = _disk_name('rawo', src) + '.bin'
     async with _lock(src):
         data = _disk_load(name)
         if not data:
-            urls = [mid, src] if mid != src and '/medium/medium/' not in mid else [src]
-            for u in urls:
-                data = await _http(u, binary=True, timeout=8, headers=_PUB_HEADERS)
-                if data and len(data) >= 1000:
-                    break
-            if data and len(data) >= 1000:
+            data = await _http(src, binary=True, timeout=18, headers=_PUB_HEADERS)
+            if not data or len(data) < 2000:
+                mid = src.replace('/TCBU/', '/TCBU/medium/')
+                if mid != src and '/medium/medium/' not in mid:
+                    data = await _http(mid, binary=True, timeout=12, headers=_PUB_HEADERS)
+            if data and len(data) >= 2000:
                 _disk_save(name, data)
-    return (data, src) if data and len(data) >= 1000 else (None, '')
-
-
-async def upload_track_image(event, png, filename='typhoon_nmc.jpg'):
-    try:
-        from core.application import get_app
-        app = get_app()
-        hosting = app.module_manager.get('image_hosting') if app and app.module_manager else None
-        if not hosting:
-            return None
-        bot = app.get_bot(event.appid)
-        return await hosting.upload_any(
-            png, filename, token_manager=getattr(bot, 'token_manager', None) if bot else None
-        )
-    except Exception as e:
-        log.warning('图床上传失败: %s', e)
-        return None
+    return (data, src) if data and len(data) >= 2000 else (None, '')
 
 
 def _name(event):
@@ -731,39 +601,321 @@ def _avatar(event):
     return ''
 
 
-def _head(event, *, md=True):
+def _font(size):
+    size = int(size)
+    hit = _FONT_CACHE.get(size)
+    if hit is not None:
+        return hit
+    font = None
+    try:
+        from PIL import ImageFont
+        for path in _FONT_CANDIDATES:
+            if os.path.isfile(path):
+                font = ImageFont.truetype(path, size=size)
+                break
+        if font is None:
+            font = ImageFont.load_default()
+    except Exception:
+        font = None
+    _FONT_CACHE[size] = font
+    return font
+
+
+def _tw(draw, text, font):
+    text = text or ''
+    if not font:
+        return max(len(text) * 8, 1), 12
+    if hasattr(draw, 'textbbox'):
+        b = draw.textbbox((0, 0), text, font=font)
+        return b[2] - b[0], b[3] - b[1]
+    return draw.textsize(text, font=font)
+
+
+def _metrics(W):
+    W = max(int(W), 640)
+    pad = max(10, min(16, W * 10 // 880))
+    ft = max(22, min(34, W * 26 // 880))
+    fs = max(20, min(32, W * 24 // 880))
+    fm = max(16, min(24, W * 18 // 880))
+    return pad, ft, fs, fm
+
+
+def _jpeg(im):
+    rgb = im.convert('RGB')
+    buf = io.BytesIO()
+    rgb.save(buf, format='JPEG', quality=92, subsampling=0, optimize=True)
+    blob = buf.getvalue()
+    if len(blob) > 4_000_000:
+        buf = io.BytesIO()
+        rgb.save(buf, format='JPEG', quality=84, subsampling=0, optimize=True)
+        blob = buf.getvalue()
+    return blob, rgb.size
+
+
+def _wrap(draw, text, font, max_w):
+    text = str(text or '')
+    if not text:
+        return ['']
+    lines, cur = [], ''
+    for ch in text:
+        if ch == '\n':
+            lines.append(cur)
+            cur = ''
+            continue
+        nxt = cur + ch
+        if cur and _tw(draw, nxt, font)[0] > max_w:
+            lines.append(cur)
+            cur = ch
+        else:
+            cur = nxt
+    if cur or not lines:
+        lines.append(cur)
+    return lines
+
+
+def _draw_title(draw, W, title, right, pad, ft, fm):
+    _, th = _tw(draw, title or ' ', _font(ft))
+    gap = 6
+    hh = gap * 2 + th
+    draw.rectangle((0, 0, W, hh), fill=_WHITE)
+    draw.text((pad, gap), title, font=_font(ft), fill=_INK)
+    if right:
+        rw, rh = _tw(draw, right, _font(fm))
+        draw.text((W - pad - rw, gap + max((th - rh) // 2, 0)), right, font=_font(fm), fill=_MUTED)
+    draw.line((0, hh - 1, W, hh - 1), fill=_LINE)
+    return hh
+
+
+def compose_detail(map_blob, view, note=''):
+    from PIL import Image, ImageDraw
+    mp = None
+    if map_blob:
+        try:
+            mp = Image.open(io.BytesIO(map_blob)).convert('RGB')
+        except Exception:
+            mp = None
+    W = max(mp.size[0] if mp else 880, 800)
+    pad, ft, fs, fm = _metrics(W)
+    probe = ImageDraw.Draw(Image.new('RGB', (W, 8)))
+    cn, en = view.get('cn') or '', view.get('en') or ''
+    heading = cn or en or '台风'
+    if en and cn and en != cn:
+        heading = f'{cn}  {en}'
+    if view.get('num'):
+        heading = f'{heading}    {view.get("num")}'
+    st = '活跃' if view.get('status') == 'start' else '停编'
+    right = f'{st}' + (f'  {note}' if note else '')
+
+    shorts, longs = [], []
+    for k, v in _info_pairs(view):
+        (longs if k in ('当前位置', '风圈', '时间') else shorts).append((k, str(v)))
+    fc = _forecast_line(view, sep='  ')
+    if fc:
+        longs.append(('预报', fc.replace('预报  ', '', 1).strip()))
+    tips = _defense_tips(view)
+
+    col_w = (W - pad * 3) // 2
+    short_lw = max((_tw(probe, k, _font(fs))[0] for k, _ in shorts), default=36) + 2
+    inner = max(col_w - short_lw - 8, 40)
+    kept, rest = [], []
+    for k, v in shorts:
+        (rest if _tw(probe, v, _font(fs))[0] > inner else kept).append((k, v))
+    shorts, longs = kept, rest + longs
+    long_blocks = []
+    for k, v in longs:
+        lw = _tw(probe, k, _font(fs))[0] + 6
+        long_blocks.append((k, lw, _wrap(probe, v, _font(fs), W - pad * 2 - lw)))
+    tip_blocks = [_wrap(probe, f'{i}. {t}', _font(fs), W - pad * 2) for i, t in enumerate(tips[:3], 1)]
+
+    lh = _tw(probe, '字', _font(fs))[1] + 1
+    mh = mp.size[1] if mp else 0
+    canvas = Image.new('RGB', (W, 80 + mh + 1200), _BG)
+    draw = ImageDraw.Draw(canvas)
+    y = _draw_title(draw, W, heading, right, pad, ft, fm)
+    if mp:
+        canvas.paste(mp, ((W - mp.size[0]) // 2, y))
+        y += mh
+    y += 6
+    for i in range(0, len(shorts), 2):
+        for col, (k, v) in enumerate(shorts[i:i + 2]):
+            x0 = pad + col * (col_w + pad)
+            draw.text((x0, y), k, font=_font(fs), fill=_MUTED)
+            draw.text((x0 + short_lw + 6, y), v, font=_font(fs), fill=_INK)
+        y += lh
+    for k, lw, wrapped in long_blocks:
+        draw.text((pad, y), k, font=_font(fs), fill=_MUTED)
+        vx = pad + lw
+        for j, line in enumerate(wrapped):
+            draw.text((vx, y + j * lh), line, font=_font(fs), fill=_INK)
+        y += max(len(wrapped), 1) * lh
+    if tip_blocks:
+        y += 2
+        draw.line((pad, y, W - pad, y), fill=_LINE)
+        y += 4
+        lab = '防护'
+        draw.text((pad, y), lab, font=_font(fs), fill=_MUTED)
+        vx = pad + _tw(probe, lab, _font(fs))[0] + 10
+        for i, block in enumerate(tip_blocks):
+            for j, line in enumerate(block):
+                draw.text((vx, y), line, font=_font(fs), fill=_INK)
+                y += lh
+    return _jpeg(canvas.crop((0, 0, W, min(canvas.size[1], y + 8))))
+
+
+def compose_card(spec, note=''):
+    from PIL import Image, ImageDraw
+    W = 880
+    pad, ft, fs, fm = _metrics(W)
+    probe = ImageDraw.Draw(Image.new('RGB', (W, 8)))
+    kind = spec.get('kind') or 'lines'
+    title = spec.get('title') or '台风'
+    rows = spec.get('rows') or []
+    lines = spec.get('lines') or []
+    canvas = Image.new('RGB', (W, 3600), _BG)
+    draw = ImageDraw.Draw(canvas)
+    y = _draw_title(draw, W, title, note, pad, ft, fm) + 6
+    lh = _tw(probe, '字', _font(fs))[1] + 4
+    if kind == 'year':
+        nx = pad
+        namx = pad + _tw(probe, '00000', _font(fs))[0] + 12
+        for num, name, st in rows:
+            draw.text((nx, y), str(num), font=_font(fs), fill=_MUTED)
+            draw.text((namx, y), name, font=_font(fs), fill=_INK)
+            sw, _ = _tw(draw, st, _font(fs))
+            draw.text((W - pad - sw, y), st, font=_font(fs), fill=_LIVE if st == '活跃' else _MUTED)
+            y += lh
+    elif kind == 'active':
+        for name, meta, pos in rows:
+            draw.text((pad, y), name, font=_font(ft), fill=_INK)
+            mw, _ = _tw(draw, meta, _font(fm))
+            draw.text((W - pad - mw, y + 2), meta, font=_font(fm), fill=_MUTED)
+            y += _tw(probe, '字', _font(ft))[1] + 2
+            if pos:
+                draw.text((pad, y), pos, font=_font(fm), fill=_MUTED)
+                y += _tw(probe, '字', _font(fm))[1] + 6
+            else:
+                y += 4
+    elif kind == 'help':
+        cmd_w = max((_tw(probe, a, _font(fs))[0] for a, _ in rows), default=80) + 4
+        for cmd, desc in rows:
+            draw.text((pad, y), cmd, font=_font(fs), fill=_INK)
+            draw.text((pad + cmd_w + 12, y), desc, font=_font(fs), fill=_MUTED)
+            y += lh
+        y += 4
+        for ln in lines:
+            fill = _MUTED if ln in ('示例',) or ln.endswith('：') else _INK
+            for wln in _wrap(probe, ln, _font(fs), W - pad * 2):
+                draw.text((pad, y), wln, font=_font(fs), fill=fill)
+                y += lh
+    else:
+        for ln in lines:
+            if not str(ln).strip():
+                y += 4
+                continue
+            for wln in _wrap(probe, ln, _font(fs), W - pad * 2):
+                draw.text((pad, y), wln, font=_font(fs), fill=_INK)
+                y += lh
+    return _jpeg(canvas.crop((0, 0, W, min(3600, y + 8))))
+
+
+def _head(event):
     name = f'@{_name(event)}'
-    av = _avatar(event) if md else ''
+    av = _avatar(event)
     return f'![头像 #24px #24px]({av}) {name}' if av else name
 
 
-async def _send_pic(event, blob, size, footer='', cache_key=None):
+async def upload_track_image(event, png, filename='typhoon_nmc.jpg'):
+    try:
+        from core.application import get_app
+        app = get_app()
+        hosting = app.module_manager.get('image_hosting') if app and app.module_manager else None
+        if not hosting:
+            return None
+        bot = app.get_bot(event.appid)
+        return await hosting.upload_any(
+            png, filename, token_manager=getattr(bot, 'token_manager', None) if bot else None
+        )
+    except Exception as e:
+        log.warning('图床上传失败: %s', e)
+        return None
+
+
+async def _sender_of(event):
+    sender = getattr(event, 'sender', None)
+    if sender:
+        return sender
+    try:
+        from core.application import get_app
+        app = get_app()
+        bot = app.get_bot(event.appid) if app else None
+        return getattr(bot, 'sender', None) if bot else None
+    except Exception:
+        return None
+
+
+async def _send_native(event, blob, filename, buttons=None):
+    sender = await _sender_of(event)
+    if not sender:
+        return False
+    try:
+        fi = await sender.upload_media(event, blob, 1, file_name=filename)
+        if not fi:
+            return False
+        kw = {'media': {'file_info': fi}, 'skip_suffix': True}
+        if buttons:
+            kw['buttons'] = buttons
+        return _ok(await event.reply(' ', **kw))
+    except Exception as e:
+        log.warning('媒体上传失败: %s', e)
+        return False
+
+
+async def _send_merged(event, blob, size, cache_key, buttons=None, extra=''):
     w, h = size
     url = _cache_get(f'host:{cache_key}') if cache_key else None
     if not url:
-        url = await upload_track_image(event, blob)
+        url = await upload_track_image(event, blob, filename='typhoon_nmc.jpg')
         if url and cache_key:
             _cache_set(f'host:{cache_key}', url, _IMG_TTL)
-    head = _head(event)
-    if url:
-        md = f'{head}\n![路径 #{w}px #{h}px]({url})'
-        if footer:
-            md += f'\n\n{footer}'
-        for force in (True, False):
+    if not url:
+        return False
+    md = f'{_head(event)}\n![路径 #{w}px #{h}px]({url})'
+    if extra:
+        md += f'\n\n{extra}'
+    for btns in ((buttons or None), None):
+        for force in (False, True):
             try:
-                r = await event.reply(md, msg_type=2, skip_suffix=True, force_verify_image_resource=force)
+                kw = {'msg_type': 2, 'skip_suffix': True, 'force_verify_image_resource': force}
+                if btns:
+                    kw['buttons'] = btns
+                r = await event.reply(md, **kw)
                 if _ok(r):
+                    log.info('路径图合并消息 %sx%s force=%s buttons=%s', w, h, force, bool(btns))
                     return True
+                log.warning('合并 Markdown 未成功 force=%s: %s', force, r)
             except Exception as e:
                 log.warning('合并 Markdown 失败 force=%s: %s', force, e)
-    cap = f'{_head(event, md=False)}\n台风路径'
-    sent = False
+    return False
+
+
+async def _send_pic(event, blob, size, buttons=None, cache_key=None, src='', extra=''):
+    w, h = size
+    if await _send_merged(event, blob, (w, h), cache_key, buttons, extra):
+        return True
+    if await _send_native(event, blob, 'typhoon_nmc.jpg', buttons):
+        log.info('路径图原图通道 %sx%s %sB src=%s', w, h, len(blob), src)
+        if extra:
+            await safe_reply(event, extra, buttons)
+        return True
     try:
-        sent = _ok(await event.reply_image(blob, cap))
+        sent = _ok(await event.reply_image(blob, ''))
     except Exception as e:
         log.warning('reply_image 失败: %s', e)
-    if sent and footer:
-        await safe_reply(event, footer)
+        sent = False
+    if sent:
+        follow = extra or ('快捷操作' if buttons else '')
+        if follow or buttons:
+            await safe_reply(event, follow or '快捷操作', buttons)
     return sent
 
 
@@ -778,48 +930,162 @@ def _pos_txt(view):
     return f'{lat}°N {lng}°E'
 
 
+def spec_lines(title, text):
+    s = str(text or '').replace('**', '').replace('`', '')
+    s = re.sub(r'\n{3,}', '\n\n', s).strip()
+    return {'kind': 'lines', 'title': title, 'lines': s.split('\n')}
+
+
+def spec_active(active, views=None):
+    views = views or [None] * len(active)
+    rows = []
+    for it, view in zip(active, views):
+        name = it['cn'] or it['en'] or str(it['id'])
+        bits = [str(it.get('num') or '')]
+        if it.get('en') and it.get('en') != it.get('cn'):
+            bits.append(it['en'])
+        pos = _pos_txt(view) if view and not isinstance(view, Exception) else ''
+        rows.append((name, ' · '.join(x for x in bits if x), f'当前位置  {pos}' if pos else ''))
+    return {'kind': 'active', 'title': f'活跃台风（{len(active)}）', 'rows': rows}
+
+
+def spec_year(bundle):
+    year = bundle.get('year') or datetime.now().year
+    rows = []
+    for it in (bundle.get('list') or [])[:30]:
+        name = it['cn'] or it['en'] or '未命名'
+        if it.get('en') and it.get('en') != it.get('cn'):
+            name = f'{name}  {it["en"]}'
+        st = '活跃' if it['status'] == 'start' else '停编'
+        rows.append((it.get('num') or '', name, st))
+    n = len(bundle.get('list') or [])
+    return {'kind': 'year', 'title': f'{year}年台风（{n}）', 'rows': rows}
+
+
+def spec_help():
+    return {
+        'kind': 'help',
+        'title': '台风查询',
+        'rows': [
+            ('当前台风', '查看当前最强台风'),
+            ('活跃台风', '查看全部活跃台风'),
+            ('本年台风', '查看本年台风名单'),
+            ('台风查询', '按名称或编号查询'),
+        ],
+        'lines': [
+            '示例',
+            '台风查询 沙德尔　　按名称',
+            '台风查询 2411　　按编号',
+            '台风列表 2023　　往年名单',
+        ],
+    }
+
+
 def fmt_list_active(active, views=None):
     if not active:
-        return '当前暂无活跃台风\n\n' + _year_bar()
-    md = f'**活跃台风（{len(active)}）**\n点选名称查看路径\n\n'
+        return '📡 当前暂无活跃台风'
+    md = f'**📡 活跃台风（{len(active)}）**\n点选名称查看路径\n\n'
     views = views or [None] * len(active)
     for it, view in zip(active, views):
-        link = _chip(it['cn'] or it['en'] or str(it['id']), f'台风查询 {it["id"]}')
-        en = f'（{it["en"]}）' if it.get('en') else ''
+        link = _chip('🌀 ' + (it['cn'] or it['en'] or str(it['id'])), f'台风查询 {it["id"]}')
+        bits = [f'`{it["num"]}`']
+        if it.get('en') and it.get('en') != it.get('cn'):
+            bits.append(it['en'])
         pos = _pos_txt(view) if view and not isinstance(view, Exception) else ''
-        extra = f'\n  当前位置：{pos}' if pos else ''
-        md += f'- {link}{en}`{it["num"]}`{extra}\n'
+        md += f'- {link}\n  {" · ".join(bits)}'
+        if pos:
+            md += f'\n  📍 {pos}'
+        md += '\n'
     return md
 
 
-def fmt_year(bundle):
+def _page_bar(year, page, pages):
+    if pages <= 1:
+        return ''
+    chips = [_chip(f'·{i}·' if i == page else str(i), f'台风列表 {year} {i}') for i in range(1, pages + 1)]
+    return f'📄 第 {page}/{pages} 页　' + '　'.join(chips)
+
+
+def fmt_year(bundle, page=1):
     year = bundle.get('year') or datetime.now().year
     rows = bundle.get('list') or []
-    md = f'**{year}年台风（{len(rows)}）**\n点选名称查看路径\n\n'
-    for it in rows[:30]:
-        st = '活跃' if it['status'] == 'start' else '停编'
-        link = _chip(it['cn'] or it['en'] or '未命名', f'台风查询 {it["id"]}')
-        en = f' {it["en"]}' if it.get('en') else ''
-        md += f'- {link} `{it["num"]}`{en} · {st}\n'
-    if len(rows) > 30:
-        md += f'\n…其余 {len(rows) - 30} 个请精确查询'
+    total = len(rows)
+    pages = max(1, (total + _PAGE_SIZE - 1) // _PAGE_SIZE)
+    page = min(max(1, int(page or 1)), pages)
+    chunk = rows[(page - 1) * _PAGE_SIZE: page * _PAGE_SIZE]
+    md = f'**📋 {year}年台风（{total}）**'
+    if pages > 1:
+        md += f'　第{page}/{pages}页'
+    md += '\n点选名称查看路径\n————————————\n\n'
+    for it in chunk:
+        link = _chip('🌀 ' + (it['cn'] or it['en'] or '未命名'), f'台风查询 {it["id"]}')
+        live = it['status'] == 'start'
+        st = '🔴 活跃' if live else '⚫ 停编'
+        bits = [f'`{it["num"]}`', st]
+        if it.get('en') and it.get('en') != it.get('cn'):
+            bits.insert(1, it['en'])
+        md += f'- {link}\n  {" · ".join(bits)}\n'
+    bar = _page_bar(year, page, pages)
+    if bar:
+        md += '\n' + bar
     md += '\n\n' + _year_bar(year)
-    return md
+    return md, page, pages
+
+
+_MD_EMOJI = {
+    '编号': '🔢', '强度': '💪', '气压': '📉', '风速': '💨',
+    '当前位置': '📍', '最后位置': '📍', '移向': '🧭', '风圈': '⭕',
+    '时间': '🕐', '生成': '🌱', '停编时间': '🕐', '过程最强': '⚡',
+}
+
+
+def _peak_point(view):
+    best, best_w = None, -1
+    for p in view.get('points') or []:
+        w = _to_float(p.get('wind')) or 0
+        if w >= best_w:
+            best, best_w = p, w
+    return best or {}
 
 
 def fmt_detail(view):
     cn, en = view.get('cn') or '', view.get('en') or ''
-    title = f'**{cn}**' + (f'（{en}）' if en and en != cn else '')
+    live = view.get('status') == 'start'
+    st = '🔴 活跃' if live else '⚫ 停编'
+    title = f'🌀 **{cn or "未命名"}**' + (f'（{en}）' if en and en != cn else '')
+    num = view.get('num') or ''
+    lines = [title, f'`{num}`　{st}' if num else st, '————————————']
     pts = view.get('points') or []
     if not pts:
-        return title + '\n暂无路径点'
-    lines = [title] + [f'{k}：{v}' for k, v in _info_pairs(view)]
+        return '\n'.join(lines + ['暂无路径点'])
+    if not live:
+        lines.append('📝 该台风已停编，以下为监测资料。')
+    last, peak = pts[-1], _peak_point(view)
+    skip = {'状态', '时间'} if not live else {'状态'}
+    for k, v in _info_pairs(view):
+        if k in skip:
+            continue
+        if k == '当前位置' and not live:
+            k = '最后位置'
+        lines.append(f'{_MD_EMOJI.get(k, "•")} {k}：{v}')
+    if not live:
+        first_t, last_t = pts[0].get('time'), last.get('time')
+        if first_t:
+            lines.append(f'{_MD_EMOJI["生成"]} 生成：{first_t}（北京时）')
+        if last_t:
+            lines.append(f'{_MD_EMOJI["停编时间"]} 停编时间：{last_t}（北京时）')
+        pw, lw = _to_float(peak.get('wind')) or 0, _to_float(last.get('wind')) or 0
+        if pw > lw + 0.5:
+            bits = [peak.get('strong') or '-', _wind_txt(peak.get('wind'))]
+            if peak.get('time'):
+                bits.append(str(peak.get('time')))
+            lines.append(f'{_MD_EMOJI["过程最强"]} 过程最强：{" · ".join(bits)}')
     fc = _forecast_line(view, sep=' · ')
-    if fc:
-        lines.append(fc.replace('预报  ', '预报：', 1))
+    if fc and live:
+        lines.append('🔮 ' + fc.replace('预报  ', '预报：', 1))
     tips = _defense_tips(view)
     if tips:
-        lines += ['', '**防护建议**'] + [f'{i}. {t}' for i, t in enumerate(tips[:3], 1)]
+        lines += ['', '💡 **防护建议**'] + [f'{i}. {t}' for i, t in enumerate(tips[:3], 1)]
     return '\n'.join(lines)
 
 
@@ -828,64 +1094,65 @@ async def _prepared_image(view):
         raw, src = await fetch_official_track_png(view)
     except Exception as e:
         log.warning('官网路径图失败: %s', e)
-        return None, None
+        return None, None, ''
     if not raw or not str(src).startswith('http'):
-        return None, None
-    pts = view.get('points') or []
-    last_t = (pts[-1].get('time') if pts else '') or ''
-    ck = _disk_name('out7', view.get('id'), src, last_t)
-    blob = _disk_load(ck + '.jpg')
-    if blob:
-        try:
-            from PIL import Image
-            return blob, Image.open(io.BytesIO(blob)).size
-        except Exception:
-            blob = None
+        return None, None, ''
     try:
-        blob, size = await asyncio.to_thread(compose_official, raw, view)
+        from PIL import Image
+        size = Image.open(io.BytesIO(raw)).size
     except Exception as e:
-        log.warning('官网图渲染失败: %s', e)
-        return None, None
-    if blob:
-        _disk_save(ck + '.jpg', blob)
-        return blob, size
-    return None, None
+        log.warning('官网图无法读取: %s', e)
+        return None, None, ''
+    return raw, size, src
 
 
-async def reply_detail(event, view, footer='', *, t0=None):
-    blob = size = None
+async def reply_detail(event, view, *, t0=None, buttons=None):
+    buttons = buttons if buttons is not None else _nav_btns()
+    live = view.get('status') == 'start'
+    if not live:
+        text = fmt_detail(view)
+        if t0 is not None:
+            text += f'\n\n耗时：{_ms(t0)}ms'
+        await safe_reply(event, text, buttons)
+        return True
+    blob = src = None
     try:
-        blob, size = await _prepared_image(view)
+        blob, _, src = await _prepared_image(view)
     except Exception as e:
         log.warning('官网图准备失败: %s', e)
-    if t0 is not None:
-        footer = (footer + f'\n耗时 {_ms(t0)}ms').strip() if footer else f'耗时 {_ms(t0)}ms'
-    if blob and size:
+    note = f'{_ms(t0)}ms' if t0 is not None else ''
+    card = size = None
+    try:
+        card, size = await asyncio.to_thread(compose_detail, blob, view, note)
+    except Exception as e:
+        log.warning('详情卡片渲染失败: %s', e)
+    if card and size:
         pts = view.get('points') or []
         last_t = (pts[-1].get('time') if pts else '') or ''
-        host_key = _disk_name('host', view.get('id'), last_t, len(blob))
-        if await _send_pic(event, blob, size, footer, cache_key=host_key):
+        host_key = _disk_name('card', view.get('id'), last_t, len(card))
+        if await _send_pic(event, card, size, buttons, cache_key=host_key, src=src):
             return True
-        log.warning('官网图发送失败，改发文字')
-    body = fmt_detail(view)
-    await safe_reply(event, f'{body}\n\n{footer}' if footer else body)
+        log.warning('详情卡片发送失败，改发文字')
+    await safe_reply(event, fmt_detail(view), buttons)
     return True
 
 
-async def safe_reply(event, text, footer=None):
+async def safe_reply(event, text, buttons=None):
     text = (text or '').strip() or '（无内容）'
-    if footer:
-        text = f'{text}\n\n{footer}'
     md = f'{_head(event)}\n{text}'
+    for btns in ((buttons or None), None):
+        try:
+            kw = {'msg_type': 2, 'skip_suffix': True}
+            if btns:
+                kw['buttons'] = btns
+            r = await event.reply(md, **kw)
+            if _ok(r):
+                return
+            log.warning('回复未成功: %s', r)
+        except Exception as e:
+            log.warning('回复失败 markdown: %s', e)
     try:
-        r = await event.reply(md, msg_type=2, skip_suffix=True)
-        if _ok(r):
-            return
-        log.warning('回复未成功: %s', r)
-    except Exception as e:
-        log.warning('回复失败 markdown: %s', e)
-    try:
-        await event.reply(f'{_head(event, md=False)}\n{text}'[:800], skip_suffix=True)
+        await event.reply(f'{_head(event)}\n{text}'[:800], skip_suffix=True)
     except Exception as e:
         log.warning('回复失败: %s', e)
 
@@ -896,15 +1163,33 @@ def guard(fn):
             return await fn(event, match)
         except Exception as e:
             log.error('%s\n%s', e, traceback.format_exc())
-            await safe_reply(event, f'台风指令出错：{type(e).__name__}: {e}')
+            await safe_reply(event, f'台风指令出错：{type(e).__name__}: {e}', _nav_btns())
     wrapper.__name__ = fn.__name__
     return wrapper
 
 
-async def _say(event, text, refresh='台风', extra=None, t0=None):
+async def _say(event, text, t0=None, *, buttons=None, extra=''):
+    if extra:
+        text = f'{(text or "").strip()}\n\n{extra}'
     if t0 is not None:
         text = f'{text}\n\n耗时：{_ms(t0)}ms'
-    await safe_reply(event, text, _nav(refresh, extra))
+    await safe_reply(event, text, buttons if buttons is not None else _nav_btns())
+
+
+async def _say_card(event, spec, extra='', t0=None, buttons=None):
+    btns = buttons if buttons is not None else _nav_btns()
+    note = f'{_ms(t0)}ms' if t0 is not None else ''
+    card = size = None
+    try:
+        card, size = await asyncio.to_thread(compose_card, spec, note)
+    except Exception as e:
+        log.warning('文字卡片渲染失败: %s', e)
+    if card and size:
+        key = _disk_name('tcard', spec.get('title'), len(card))
+        if await _send_pic(event, card, size, btns, cache_key=key, extra=extra):
+            return
+    text = spec.get('md') or spec.get('title') or '台风'
+    await _say(event, text, t0=t0, buttons=btns, extra='' if spec.get('md') else extra)
 
 
 # ---------- 指令 ----------
@@ -916,6 +1201,17 @@ def _arg(match):
         return ''
 
 
+async def _reply_year_list(event, year, page=1, t0=None):
+    bundle = await nmc_list(year)
+    if bundle is None:
+        return await _say(event, '❗ 暂时无法获取台风数据，请稍后重试')
+    bundle['year'] = year
+    if not bundle.get('list'):
+        return await _say(event, _hint_miss(), extra=_year_bar(year))
+    md, page, pages = fmt_year(bundle, page)
+    await _say(event, md, t0=t0, buttons=_list_btns(year, page, pages))
+
+
 @handler(r'^\s*/?(?:台风|当前台风|最强台风)(?:\s+(\S.*?))?\s*$', name='台风', desc='查看当前最强台风', ignore_at_check=True, block=True)
 @guard
 async def cmd_strongest(event, match):
@@ -925,10 +1221,10 @@ async def cmd_strongest(event, match):
     start = time.time()
     bundle = await nmc_list()
     if bundle is None:
-        return await _say(event, '暂时无法获取台风数据，请稍后重试')
+        return await _say(event, '❗ 暂时无法获取台风数据，请稍后重试')
     active = [x for x in bundle['list'] if x['status'] == 'start']
     if not active:
-        return await _say(event, '当前暂无活跃台风\n\n' + _year_bar(), extra=('本年台风', '今年台风'))
+        return await _say(event, '📡 当前暂无活跃台风', extra=_year_bar(), t0=start)
     views = await asyncio.gather(*[nmc_view(it['id']) for it in active], return_exceptions=True)
     best_view, best_wind = None, -1
     for view in views:
@@ -938,8 +1234,8 @@ async def cmd_strongest(event, match):
         if w >= best_wind:
             best_wind, best_view = w, view
     if not best_view:
-        return await _say(event, '暂时无法获取该台风详情')
-    await reply_detail(event, best_view, _nav('台风'), t0=start)
+        return await _say(event, '❗ 暂时无法获取该台风详情')
+    await reply_detail(event, best_view, t0=start)
 
 
 @handler(r'^\s*/?(?:台风活跃|活跃台风)(?:\s*(\S.*?))?\s*$', name='活跃台风', desc='查看活跃台风', ignore_at_check=True, block=True)
@@ -947,22 +1243,27 @@ async def cmd_strongest(event, match):
 async def cmd_list(event, match):
     extra = _arg(match)
     if extra:
-        year = _parse_year(extra)
+        year, page = _parse_year_page(extra)
         if year is None:
             return await _say(event, _hint_miss())
-    else:
-        year = None
+        return await _reply_year_list(event, year, page, t0=time.time())
+    year = None
     start = time.time()
     bundle = await nmc_list(year)
     if bundle is None:
-        return await _say(event, '暂时无法获取台风数据，请稍后重试', refresh='活跃台风')
-    if year:
-        md = fmt_year(bundle)
-    else:
-        active = [x for x in bundle['list'] if x['status'] == 'start']
-        views = await asyncio.gather(*[nmc_view(it['id']) for it in active], return_exceptions=True) if active else []
-        md = fmt_list_active(active, views)
-    await _say(event, md, refresh=f'活跃台风 {year}' if year else '活跃台风', extra=('本年台风', '今年台风'), t0=start)
+        return await _say(event, '❗ 暂时无法获取台风数据，请稍后重试')
+    active = [x for x in bundle['list'] if x['status'] == 'start']
+    views = await asyncio.gather(*[nmc_view(it['id']) for it in active], return_exceptions=True) if active else []
+    if not active:
+        return await _say(event, '📡 当前暂无活跃台风', extra=_year_bar(), t0=start)
+    chips = []
+    for it in active:
+        show = it['cn'] or it['en'] or str(it['id'])
+        chips.append(_chip('🌀 ' + show, f'台风查询 {it["id"]}'))
+    extra = '点选名称查看路径\n' + '\n'.join(chips)
+    spec = spec_active(active, views)
+    spec['md'] = fmt_list_active(active, views)
+    await _say_card(event, spec, extra=extra, t0=start)
 
 
 @handler(r'^\s*/?(?:台风列表|台风年份|今年台风|本年台风)(?:\s*(\S.*?))?\s*$', name='台风年份', desc='查看本年台风', ignore_at_check=True, block=True)
@@ -972,23 +1273,11 @@ async def cmd_year(event, match):
     head = _cmd_head(match)
     implied = head in ('今年台风', '本年台风')
     if not extra and not implied:
-        return await _say(event, _hint_year())
-    if extra:
-        year = _parse_year(extra)
-        if year is None:
-            return await _say(event, _hint_miss())
-    else:
-        year = datetime.now().year
-    start = time.time()
-    bundle = await nmc_list(year)
-    if bundle is None:
-        return await _say(event, '暂时无法获取台风数据，请稍后重试')
-    bundle['year'] = year
-    if not bundle.get('list'):
+        return await _say(event, _hint_year(), extra=_year_bar())
+    year, page = _parse_year_page(extra, default_year=datetime.now().year if implied else None)
+    if year is None:
         return await _say(event, _hint_miss())
-    now = datetime.now().year
-    refresh = '台风列表' if year == now else f'台风列表 {year}'
-    await _say(event, fmt_year(bundle), refresh=refresh, t0=start)
+    await _reply_year_list(event, year, page, t0=time.time())
 
 
 @handler(r'^\s*/?(?:台风查询|查台风)(?:\s*(\S.*?))?\s*$', name='台风详情', desc='按名称或编号查询台风', ignore_at_check=True, block=True)
@@ -996,17 +1285,11 @@ async def cmd_year(event, match):
 async def cmd_detail(event, match):
     keyword = _arg(match)
     if not keyword:
-        return await _say(event, _hint_query())
+        return await _say(event, _hint_query(), extra=_year_bar())
     start = time.time()
-    year = _parse_year(keyword)
+    year, page = _parse_year_page(keyword)
     if year is not None:
-        bundle = await nmc_list(year)
-        if bundle is None:
-            return await _say(event, '暂时无法获取台风数据，请稍后重试')
-        bundle['year'] = year
-        if not bundle.get('list'):
-            return await _say(event, _hint_miss())
-        return await _say(event, fmt_year(bundle), refresh=f'台风列表 {year}', t0=start)
+        return await _reply_year_list(event, year, page, t0=start)
     if re.fullmatch(r'(19|20)\d{2}', keyword):
         return await _say(event, _hint_miss())
     tid, err = await resolve_id(keyword)
@@ -1015,22 +1298,24 @@ async def cmd_detail(event, match):
     view = await nmc_view(tid)
     if not view:
         return await _say(event, _hint_miss())
-    await reply_detail(event, view, _nav(f'台风查询 {keyword}'), t0=start)
+    await reply_detail(event, view, t0=start)
 
 
 @handler(r'^\s*/?(?:台风帮助|台风怎么用|使用说明)(?:\s+(\S.*?))?\s*$', name='台风帮助', desc='使用说明', ignore_at_check=True, block=True)
 @guard
 async def cmd_help(event, match):
     if _arg(match):
-        await safe_reply(event, _hint_noarg('台风帮助'))
+        await _say(event, _hint_noarg('台风帮助'))
         return
-    await safe_reply(event, (
-        '**台风查询**\n\n'
-        f'{_chip("当前台风", "台风")}　查看当前最强台风\n'
-        f'{_chip("活跃台风", "活跃台风")}　查看全部活跃台风\n'
-        f'{_chip("本年台风", "本年台风")}　查看本年台风名单\n'
-        f'{_chip("台风查询", "台风查询 ")}　按名称或编号查询\n\n'
-        '示例：`台风查询 沙德尔`　`台风查询 2411`\n'
-        '往年名单：`台风列表 2023`\n\n'
-        f'{_year_bar()}'
-    ))
+    await _say(event, (
+        '**🌀 台风查询**\n'
+        '————————————\n'
+        f'{_chip("🌀 当前台风", "台风")}　查看当前最强台风\n'
+        f'{_chip("📡 活跃台风", "活跃台风")}　查看全部活跃台风\n'
+        f'{_chip("📋 本年台风", "本年台风")}　查看本年台风名单\n'
+        f'{_chip("🔍 台风查询", "台风查询 ")}　按名称或编号查询\n'
+        '————————————\n'
+        '💡 示例：`台风查询 沙德尔`　`台风查询 2411`\n'
+        '📅 往年名单：`台风列表 2023`\n\n'
+        + _year_bar()
+    ), buttons=[])
