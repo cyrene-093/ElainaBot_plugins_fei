@@ -2,7 +2,7 @@ __plugin_meta__ = {
     'name': '台风图',
     'author': '茉莉奶绿（原创） / 飞行漂绒（修改优化）',
     'description': '中央气象台台风查询（最强/活跃出图，停编走 Markdown）',
-    'version': '1.1.0',
+    'version': '1.2.0',
 }
 
 import asyncio
@@ -631,6 +631,29 @@ def _tw(draw, text, font):
     return draw.textsize(text, font=font)
 
 
+def _line_h(draw, font, extra=8):
+    size = getattr(font, 'size', None) or 20
+    h = _tw(draw, '国Agyp', font)[1]
+    return max(int(h + extra), int(size * 1.42))
+
+
+def _ellipsize(draw, text, font, max_w):
+    text = str(text or '')
+    if max_w <= 0:
+        return ''
+    if _tw(draw, text, font)[0] <= max_w:
+        return text
+    ell = '…'
+    if _tw(draw, ell, font)[0] >= max_w:
+        return ell
+    out = ''
+    for ch in text:
+        if _tw(draw, out + ch + ell, font)[0] > max_w:
+            break
+        out += ch
+    return (out or text[:1]) + ell
+
+
 def _metrics(W):
     W = max(int(W), 640)
     pad = max(10, min(16, W * 10 // 880))
@@ -674,10 +697,16 @@ def _wrap(draw, text, font, max_w):
 
 
 def _draw_title(draw, W, title, right, pad, ft, fm):
-    _, th = _tw(draw, title or ' ', _font(ft))
-    gap = 6
-    hh = gap * 2 + th
+    title = str(title or ' ')
+    right = str(right or '')
+    th = _tw(draw, title, _font(ft))[1]
+    rh = _tw(draw, right, _font(fm))[1] if right else 0
+    gap = 8
+    hh = gap * 2 + max(th, rh)
     draw.rectangle((0, 0, W, hh), fill=_WHITE)
+    rw = _tw(draw, right, _font(fm))[0] if right else 0
+    title_max = max(40, W - pad * 2 - (rw + 28 if right else 0))
+    title = _ellipsize(draw, title, _font(ft), title_max)
     draw.text((pad, gap), title, font=_font(ft), fill=_INK)
     if right:
         rw, rh = _tw(draw, right, _font(fm))
@@ -699,12 +728,8 @@ def compose_detail(map_blob, view, note=''):
     probe = ImageDraw.Draw(Image.new('RGB', (W, 8)))
     cn, en = view.get('cn') or '', view.get('en') or ''
     heading = cn or en or '台风'
-    if en and cn and en != cn:
-        heading = f'{cn}  {en}'
-    if view.get('num'):
-        heading = f'{heading}    {view.get("num")}'
     st = '活跃' if view.get('status') == 'start' else '停编'
-    right = f'{st}' + (f'  {note}' if note else '')
+    right = '  '.join(x for x in (str(view.get('num') or ''), st) if x)
 
     shorts, longs = [], []
     for k, v in _info_pairs(view):
@@ -715,51 +740,68 @@ def compose_detail(map_blob, view, note=''):
     tips = _defense_tips(view)
 
     col_w = (W - pad * 3) // 2
-    short_lw = max((_tw(probe, k, _font(fs))[0] for k, _ in shorts), default=36) + 2
-    inner = max(col_w - short_lw - 8, 40)
+    font_s = _font(fs)
+    lh = _line_h(probe, font_s, 8)
     kept, rest = [], []
     for k, v in shorts:
-        (rest if _tw(probe, v, _font(fs))[0] > inner else kept).append((k, v))
+        lw = _tw(probe, k, font_s)[0] + 8
+        (rest if _tw(probe, v, font_s)[0] > max(col_w - lw - 4, 24) else kept).append((k, v))
     shorts, longs = kept, rest + longs
     long_blocks = []
     for k, v in longs:
-        lw = _tw(probe, k, _font(fs))[0] + 6
-        long_blocks.append((k, lw, _wrap(probe, v, _font(fs), W - pad * 2 - lw)))
-    tip_blocks = [_wrap(probe, f'{i}. {t}', _font(fs), W - pad * 2) for i, t in enumerate(tips[:3], 1)]
+        lw = _tw(probe, k, font_s)[0] + 10
+        long_blocks.append((k, lw, _wrap(probe, v, font_s, max(40, W - pad * 2 - lw))))
+    lab_w = _tw(probe, '防护', font_s)[0] + 10
+    tip_w = max(40, W - pad * 2 - lab_w)
+    tip_blocks = [_wrap(probe, f'{i}. {t}', font_s, tip_w) for i, t in enumerate(tips[:3], 1)]
 
-    lh = _tw(probe, '字', _font(fs))[1] + 1
     mh = mp.size[1] if mp else 0
-    canvas = Image.new('RGB', (W, 80 + mh + 1200), _BG)
+    canvas = Image.new('RGB', (W, 80 + mh + 1400), _BG)
     draw = ImageDraw.Draw(canvas)
     y = _draw_title(draw, W, heading, right, pad, ft, fm)
+    if en and cn and en != cn:
+        sub_h = _line_h(probe, _font(fm), 4)
+        draw.rectangle((0, y, W, y + sub_h + 6), fill=_WHITE)
+        en_max = W - pad * 2 - (_tw(draw, note, _font(fm))[0] + 16 if note else 0)
+        draw.text((pad, y), _ellipsize(draw, en, _font(fm), en_max), font=_font(fm), fill=_MUTED)
+        if note:
+            nw, _ = _tw(draw, note, _font(fm))
+            draw.text((W - pad - nw, y), note, font=_font(fm), fill=_MUTED)
+        y += sub_h + 6
+        draw.line((0, y - 1, W, y - 1), fill=_LINE)
     if mp:
         canvas.paste(mp, ((W - mp.size[0]) // 2, y))
         y += mh
-    y += 6
+    y += 10
     for i in range(0, len(shorts), 2):
-        for col, (k, v) in enumerate(shorts[i:i + 2]):
+        row = shorts[i:i + 2]
+        for col, (k, v) in enumerate(row):
             x0 = pad + col * (col_w + pad)
-            draw.text((x0, y), k, font=_font(fs), fill=_MUTED)
-            draw.text((x0 + short_lw + 6, y), v, font=_font(fs), fill=_INK)
+            lw = _tw(draw, k, font_s)[0] + 8
+            draw.text((x0, y), k, font=font_s, fill=_MUTED)
+            vmax = max(24, col_w - lw)
+            draw.text((x0 + lw, y), _ellipsize(draw, v, font_s, vmax), font=font_s, fill=_INK)
         y += lh
+    if shorts and long_blocks:
+        y += 4
     for k, lw, wrapped in long_blocks:
-        draw.text((pad, y), k, font=_font(fs), fill=_MUTED)
+        draw.text((pad, y), k, font=font_s, fill=_MUTED)
         vx = pad + lw
         for j, line in enumerate(wrapped):
-            draw.text((vx, y + j * lh), line, font=_font(fs), fill=_INK)
-        y += max(len(wrapped), 1) * lh
+            draw.text((vx, y + j * lh), line, font=font_s, fill=_INK)
+        y += max(len(wrapped), 1) * lh + 2
     if tip_blocks:
-        y += 2
-        draw.line((pad, y, W - pad, y), fill=_LINE)
         y += 4
-        lab = '防护'
-        draw.text((pad, y), lab, font=_font(fs), fill=_MUTED)
-        vx = pad + _tw(probe, lab, _font(fs))[0] + 10
-        for i, block in enumerate(tip_blocks):
+        draw.line((pad, y, W - pad, y), fill=_LINE)
+        y += 8
+        vx = pad + lab_w
+        draw.text((pad, y), '防护', font=font_s, fill=_MUTED)
+        for block in tip_blocks:
             for j, line in enumerate(block):
-                draw.text((vx, y), line, font=_font(fs), fill=_INK)
+                draw.text((vx, y), line, font=font_s, fill=_INK)
                 y += lh
-    return _jpeg(canvas.crop((0, 0, W, min(canvas.size[1], y + 8))))
+            y += 2
+    return _jpeg(canvas.crop((0, 0, W, min(canvas.size[1], y + 10))))
 
 
 def compose_card(spec, note=''):
@@ -773,28 +815,33 @@ def compose_card(spec, note=''):
     lines = spec.get('lines') or []
     canvas = Image.new('RGB', (W, 3600), _BG)
     draw = ImageDraw.Draw(canvas)
-    y = _draw_title(draw, W, title, note, pad, ft, fm) + 6
-    lh = _tw(probe, '字', _font(fs))[1] + 4
+    y = _draw_title(draw, W, title, note, pad, ft, fm) + 8
+    lh = _line_h(probe, _font(fs), 8)
+    name_lh = _line_h(probe, _font(ft), 10)
+    meta_lh = _line_h(probe, _font(fm), 4)
     if kind == 'year':
         nx = pad
         namx = pad + _tw(probe, '00000', _font(fs))[0] + 12
         for num, name, st in rows:
-            draw.text((nx, y), str(num), font=_font(fs), fill=_MUTED)
-            draw.text((namx, y), name, font=_font(fs), fill=_INK)
             sw, _ = _tw(draw, st, _font(fs))
+            name_max = max(40, W - pad - namx - sw - 16)
+            draw.text((nx, y), str(num), font=_font(fs), fill=_MUTED)
+            draw.text((namx, y), _ellipsize(draw, name, _font(fs), name_max), font=_font(fs), fill=_INK)
             draw.text((W - pad - sw, y), st, font=_font(fs), fill=_LIVE if st == '活跃' else _MUTED)
             y += lh
     elif kind == 'active':
         for name, meta, pos in rows:
-            draw.text((pad, y), name, font=_font(ft), fill=_INK)
-            mw, _ = _tw(draw, meta, _font(fm))
-            draw.text((W - pad - mw, y + 2), meta, font=_font(fm), fill=_MUTED)
-            y += _tw(probe, '字', _font(ft))[1] + 2
+            for wln in _wrap(probe, name, _font(ft), W - pad * 2):
+                draw.text((pad, y), wln, font=_font(ft), fill=_INK)
+                y += name_lh
+            if meta:
+                draw.text((pad, y), _ellipsize(draw, meta, _font(fm), W - pad * 2), font=_font(fm), fill=_MUTED)
+                y += meta_lh
             if pos:
-                draw.text((pad, y), pos, font=_font(fm), fill=_MUTED)
-                y += _tw(probe, '字', _font(fm))[1] + 6
+                draw.text((pad, y), _ellipsize(draw, pos, _font(fm), W - pad * 2), font=_font(fm), fill=_MUTED)
+                y += meta_lh + 6
             else:
-                y += 4
+                y += 8
     elif kind == 'help':
         cmd_w = max((_tw(probe, a, _font(fs))[0] for a, _ in rows), default=80) + 4
         for cmd, desc in rows:
